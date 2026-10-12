@@ -80,3 +80,41 @@ let%expect_test "backoff" =
   [%expect {| (500ms 1s 2s 4s 8s 16s 30s 30s 30s) |}];
   return ()
 ;;
+
+let%expect_test "jittered delays stay within the band and vary" =
+  Quickcheck.test
+    ~sexp_of:[%sexp_of: int * float * int]
+    (Quickcheck.Generator.tuple3
+       (Int.gen_incl 1 60_000)
+       (Float.gen_incl 0. 1.5)
+       Int.quickcheck_generator)
+    ~f:(fun (ms, jitter, seed) ->
+      let span = Time_ns.Span.of_int_ms ms in
+      let random_state = Random.State.make [| seed |] in
+      let delay = T.jittered ~jitter ~random_state span in
+      let band = Float.min jitter 1. in
+      let lo = Time_ns.Span.scale span (1. -. band) in
+      let hi = Time_ns.Span.scale span (1. +. band) in
+      if Time_ns.Span.(delay < lo || delay > hi)
+      then
+        raise_s
+          [%message
+            "out of band"
+              (span : Time_ns.Span.t)
+              (jitter : float)
+              (delay : Time_ns.Span.t)]);
+  let random_state = Random.State.make [| 42 |] in
+  let delays =
+    List.init 20 ~f:(fun _ ->
+      T.jittered ~jitter:0.2 ~random_state (Time_ns.Span.of_sec 1.))
+  in
+  print_s
+    [%sexp
+      { distinct =
+          (List.length (List.dedup_and_sort delays ~compare:Time_ns.Span.compare) : int)
+      ; no_jitter =
+          (T.jittered ~jitter:0. ~random_state (Time_ns.Span.of_sec 1.) : Time_ns.Span.t)
+      }];
+  [%expect {| ((distinct 20) (no_jitter 1s)) |}];
+  return ()
+;;

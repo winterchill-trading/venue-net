@@ -44,6 +44,9 @@ type t
     - [initial_backoff] (default 0.5s) and [max_backoff] (default 30s) bound the delay
       between reconnection attempts; it doubles after each failure and resets after a
       successful handshake.
+    - [backoff_jitter] (default 0.2) spreads each delay uniformly over
+      [delay * (1 +/- backoff_jitter)] (clamped to [0, 1]; [0.] disables it), so many
+      clients dropped at once do not reconnect in lockstep. The chosen delay is logged.
     - [on_connect] runs after every successful handshake, the first one included, as soon
       as frames start being read; use it to authenticate and (re)subscribe. [reconnects t]
       tells a first connection ([0]) from a reconnection. Exceptions it raises are logged;
@@ -58,6 +61,7 @@ val connect
   -> ?max_silent_intervals:int
   -> ?initial_backoff:Time_ns.Span.t
   -> ?max_backoff:Time_ns.Span.t
+  -> ?backoff_jitter:float
   -> ?on_connect:(t -> unit Deferred.t)
   -> ?log_name:string
   -> ?time_source:Time_source.t
@@ -105,4 +109,12 @@ module For_testing : sig
     -> max:Time_ns.Span.t
     -> attempts:int
     -> Time_ns.Span.t list
+
+  (** [jittered ~jitter ~random_state span] is the delay actually slept for a backoff step
+      of [span]. *)
+  val jittered
+    :  jitter:float
+    -> random_state:Random.State.t
+    -> Time_ns.Span.t
+    -> Time_ns.Span.t
 end

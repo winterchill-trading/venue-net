@@ -100,6 +100,16 @@ let random_state =
   lazy (Random.State.make [| Time_ns.to_int_ns_since_epoch (Time_ns.now ()) |])
 ;;
 
+(* Spreads [span] uniformly over [span * (1 - jitter), span * (1 + jitter)], so clients
+   that lost their connections together do not all come back at the same instant. *)
+let jittered ~jitter ~random_state span =
+  if Float.(jitter <= 0.)
+  then span
+  else (
+    let jitter = Float.min jitter 1. in
+    Time_ns.Span.scale span (1. +. (jitter *. (Random.State.float random_state 2. -. 1.))))
+;;
+
 let new_key () =
   let state = force random_state in
   base64 (String.init 16 ~f:(fun _ -> Char.of_int_exn (Random.State.int state 256)))
@@ -195,6 +205,7 @@ type t =
   ; max_silent_intervals : int
   ; initial_backoff : Time_ns.Span.t
   ; max_backoff : Time_ns.Span.t
+  ; backoff_jitter : float
   ; on_connect : t -> unit Deferred.t
   ; log_name : string
   ; time_source : Time_source.t
@@ -288,8 +299,16 @@ let rec reconnect_loop t ~delay =
   if is_closed t
   then return ()
   else (
+    let sleep =
+      jittered ~jitter:t.backoff_jitter ~random_state:(force random_state) delay
+    in
+    Log.Global.info_s
+      [%message
+        (sprintf "%s: reconnecting" t.log_name)
+          ~url:(url_string t : string)
+          ~after:(sleep : Time_ns.Span.t)];
     let%bind () =
-      Deferred.any [ Time_source.after t.time_source delay; Ivar.read t.closed ]
+      Deferred.any [ Time_source.after t.time_source sleep; Ivar.read t.closed ]
     in
     if is_closed t
     then return ()
@@ -316,6 +335,7 @@ let connect
   ?(max_silent_intervals = 2)
   ?(initial_backoff = Time_ns.Span.of_sec 0.5)
   ?(max_backoff = Time_ns.Span.of_sec 30.)
+  ?(backoff_jitter = 0.2)
   ?(on_connect = fun _ -> return ())
   ?(log_name = "venue-net ws")
   ?(time_source = Time_source.wall_clock ())
@@ -331,6 +351,7 @@ let connect
     ; max_silent_intervals
     ; initial_backoff
     ; max_backoff
+    ; backoff_jitter
     ; on_connect
     ; log_name
     ; time_source
@@ -363,4 +384,5 @@ module For_testing = struct
   let handshake_request = handshake_request
   let check_handshake_response = check_handshake_response
   let backoff = backoff
+  let jittered = jittered
 end
