@@ -197,6 +197,7 @@ type t =
   ; max_backoff : Time_ns.Span.t
   ; on_connect : t -> unit Deferred.t
   ; log_name : string
+  ; time_source : Time_source.t
   ; mutable connection : Connection.t option
   ; mutable reconnects : int
   ; messages_reader : string Pipe.Reader.t
@@ -237,9 +238,10 @@ let watch t (connection : Connection.t) ~received =
   | None -> ()
   | Some interval ->
     let silent_intervals = ref 0 in
-    Clock_ns.every'
-      ~start:(Clock_ns.after interval)
+    Time_source.every'
+      ~start:(Time_source.after t.time_source interval)
       ~stop:(Pipe.closed connection.from_server)
+      t.time_source
       interval
       (fun () ->
          if !received then silent_intervals := 0 else incr silent_intervals;
@@ -286,7 +288,9 @@ let rec reconnect_loop t ~delay =
   if is_closed t
   then return ()
   else (
-    let%bind () = Deferred.any [ Clock_ns.after delay; Ivar.read t.closed ] in
+    let%bind () =
+      Deferred.any [ Time_source.after t.time_source delay; Ivar.read t.closed ]
+    in
     if is_closed t
     then return ()
     else (
@@ -314,6 +318,7 @@ let connect
   ?(max_backoff = Time_ns.Span.of_sec 30.)
   ?(on_connect = fun _ -> return ())
   ?(log_name = "venue-net ws")
+  ?(time_source = Time_source.wall_clock ())
   ~url
   ()
   =
@@ -328,6 +333,7 @@ let connect
     ; max_backoff
     ; on_connect
     ; log_name
+    ; time_source
     ; connection = None
     ; reconnects = 0
     ; messages_reader
