@@ -1,0 +1,14 @@
+(library
+ (name venue_net)
+ (public_name venue-net)
+ (libraries
+  core
+  async
+  yojson
+  uri
+  cohttp
+  cohttp-async
+  conduit-async
+  async_websocket)
+ (preprocess
+  (pps ppx_jane)))
