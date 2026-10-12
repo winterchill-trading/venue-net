@@ -57,8 +57,11 @@ val connect
   -> ?max_silent_intervals:int            (* default 2 *)
   -> ?initial_backoff:Time_ns.Span.t      (* default 0.5s *)
   -> ?max_backoff:Time_ns.Span.t          (* default 30s *)
+  -> ?backoff_jitter:float                (* default 0.2 *)
+  -> ?handshake_timeout:Time_ns.Span.t    (* default 10s *)
   -> ?on_connect:(t -> unit Deferred.t)
   -> ?log_name:string
+  -> ?time_source:Time_source.t           (* default wall clock *)
   -> url:Uri.t
   -> unit
   -> t Or_error.t Deferred.t
@@ -78,7 +81,13 @@ val is_closed    : t -> bool
 - `connect` returns once the first handshake succeeds or fails; afterwards the
   connection is maintained in the background. On close it reconnects with exponential
   backoff (doubling from `initial_backoff` to `max_backoff`, reset after a successful
-  handshake).
+  handshake). Each delay is spread uniformly over `delay * (1 +/- backoff_jitter)` so
+  clients dropped together do not reconnect in lockstep, and the chosen delay is logged.
+- `handshake_timeout` bounds the TCP connect plus upgrade handshake of every attempt; a
+  timed out attempt counts as a failure and its socket is closed.
+- `time_source` drives the keepalive, the watchdog, the handshake timeout and the
+  reconnect delay. Pass a `Time_source.create` clock in tests to step them; socket I/O
+  still runs in real time.
 - Keepalive: `` `Text (payload, interval) `` sends an application ping (Hyperliquid
   `{"method":"ping"}`, Bybit `{"op":"ping"}`); `` `Frame interval `` sends websocket
   ping frames; `` `None `` sends nothing (Binance pings the client). Incoming ping frames
@@ -97,6 +106,9 @@ val is_closed    : t -> bool
 
 `dune test` runs without network access: an HTTP echo server on `127.0.0.1` (methods,
 content types, form encoding, transport errors, `decode_json`), the handshake (RFC 6455
-vectors), base64, backoff, and a loopback websocket server that checks extra handshake
+vectors), base64, backoff and a jitter band property, and a loopback websocket server that checks extra handshake
 headers, `on_connect`, server close and reconnect, text keepalive, silent-connection
 replacement, ping-frame pongs as traffic, a refused upgrade and shutdown.
+`test_ws_fake_clock.ml` runs the reconnect backoff (1 s, 2 s, 4 s) on a synthetic clock
+and checks that a listener which never answers the upgrade times out and leaves the open
+file descriptor count where it started.
