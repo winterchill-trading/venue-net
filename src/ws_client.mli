@@ -47,14 +47,17 @@ type t
     - [backoff_jitter] (default 0.2) spreads each delay uniformly over
       [delay * (1 +/- backoff_jitter)] (clamped to [0, 1]; [0.] disables it), so many
       clients dropped at once do not reconnect in lockstep. The chosen delay is logged.
+    - [handshake_timeout] (default 10s) bounds the TCP connect plus upgrade handshake of
+      every attempt. A timed out attempt counts as a failed one, and its socket is closed
+      rather than left to finish in the background.
     - [on_connect] runs after every successful handshake, the first one included, as soon
       as frames start being read; use it to authenticate and (re)subscribe. [reconnects t]
       tells a first connection ([0]) from a reconnection. Exceptions it raises are logged;
       the connection is kept.
     - [log_name] (default ["venue-net ws"]) prefixes log lines.
-    - [time_source] (default the wall clock) drives the keepalive, the silence watchdog
-      and the reconnection delay, so tests can step them with a synthetic clock. Socket
-      I/O still runs in real time. *)
+    - [time_source] (default the wall clock) drives the keepalive, the silence watchdog,
+      the handshake timeout and the reconnection delay, so tests can step them with a
+      synthetic clock. Socket I/O still runs in real time. *)
 val connect
   :  ?headers:(string * string) list
   -> ?ping:Ping.t
@@ -62,6 +65,7 @@ val connect
   -> ?initial_backoff:Time_ns.Span.t
   -> ?max_backoff:Time_ns.Span.t
   -> ?backoff_jitter:float
+  -> ?handshake_timeout:Time_ns.Span.t
   -> ?on_connect:(t -> unit Deferred.t)
   -> ?log_name:string
   -> ?time_source:Time_source.t

@@ -161,31 +161,52 @@ module Connection = struct
     ; to_server : string Pipe.Writer.t
     }
 
-  let open_ ~headers uri =
-    Monitor.try_with_or_error ~extract_exn:true (fun () ->
-      let%bind reader, writer = tcp_connect uri in
-      let fail err =
-        let%bind () = Writer.close writer in
-        let%bind () = Reader.close reader in
-        Error.raise err
-      in
-      let key = new_key () in
-      Writer.write writer (handshake_request ~headers uri ~key);
-      let%bind () = Writer.flushed writer in
-      match%bind read_handshake_response reader with
-      | Error err -> fail err
-      | Ok (status_line, response_headers) ->
-        (match check_handshake_response ~key ~status_line ~headers:response_headers with
-         | Error err -> fail err
-         | Ok () ->
-           let ws = Websocket.create ~opcode:`Text ~role:Client reader writer in
-           let from_server, to_server = Websocket.pipes ws in
-           return { ws; from_server; to_server }))
+  let close t = Websocket.close t.ws ~code:Normal_closure ~reason:""
+
+  let close_socket (reader, writer) =
+    let%bind () = Writer.close writer in
+    Reader.close reader
+  ;;
+
+  (* TCP connect plus upgrade handshake, bounded by [timeout] on [time_source]. A timed
+     out attempt is not left running: its socket is closed as soon as it exists, which
+     fails a pending handshake read, and a connection that still completes is closed. *)
+  let open_ ~time_source ~timeout ~headers uri =
+    let socket = Ivar.create () in
+    let attempt =
+      Monitor.try_with_or_error ~rest:`Log ~extract_exn:true (fun () ->
+        let%bind reader, writer = tcp_connect uri in
+        Ivar.fill_exn socket (reader, writer);
+        let fail err =
+          let%bind () = close_socket (reader, writer) in
+          Error.raise err
+        in
+        let key = new_key () in
+        Writer.write writer (handshake_request ~headers uri ~key);
+        let%bind () = Writer.flushed writer in
+        match%bind read_handshake_response reader with
+        | Error err -> fail err
+        | Ok (status_line, response_headers) ->
+          (match check_handshake_response ~key ~status_line ~headers:response_headers with
+           | Error err -> fail err
+           | Ok () ->
+             let ws = Websocket.create ~opcode:`Text ~role:Client reader writer in
+             let from_server, to_server = Websocket.pipes ws in
+             return { ws; from_server; to_server }))
+    in
+    (match%map Time_source.with_timeout time_source timeout attempt with
+     | `Result result -> result
+     | `Timeout ->
+       upon (Ivar.read socket) (fun socket -> don't_wait_for (close_socket socket));
+       upon attempt (function
+         | Ok connection -> don't_wait_for (close connection)
+         | Error _ -> ());
+       Or_error.error_s
+         [%message "websocket handshake timed out" (timeout : Time_ns.Span.t)])
     |> Deferred.Or_error.tag_s
          ~tag:[%message "websocket connect" ~uri:(Uri.to_string uri : string)]
   ;;
 
-  let close t = Websocket.close t.ws ~code:Normal_closure ~reason:""
   let send t frame = Pipe.write_if_open t.to_server frame
 
   let send_ping t (ping : Ping.t) =
@@ -206,6 +227,7 @@ type t =
   ; initial_backoff : Time_ns.Span.t
   ; max_backoff : Time_ns.Span.t
   ; backoff_jitter : float
+  ; handshake_timeout : Time_ns.Span.t
   ; on_connect : t -> unit Deferred.t
   ; log_name : string
   ; time_source : Time_source.t
@@ -313,7 +335,13 @@ let rec reconnect_loop t ~delay =
     if is_closed t
     then return ()
     else (
-      match%bind Connection.open_ ~headers:t.headers t.url with
+      match%bind
+        Connection.open_
+          ~time_source:t.time_source
+          ~timeout:t.handshake_timeout
+          ~headers:t.headers
+          t.url
+      with
       | Error error ->
         Log.Global.error_s
           [%message (sprintf "%s: reconnect failed" t.log_name) (error : Error.t)];
@@ -336,13 +364,16 @@ let connect
   ?(initial_backoff = Time_ns.Span.of_sec 0.5)
   ?(max_backoff = Time_ns.Span.of_sec 30.)
   ?(backoff_jitter = 0.2)
+  ?(handshake_timeout = Time_ns.Span.of_sec 10.)
   ?(on_connect = fun _ -> return ())
   ?(log_name = "venue-net ws")
   ?(time_source = Time_source.wall_clock ())
   ~url
   ()
   =
-  let%map.Deferred.Or_error connection = Connection.open_ ~headers url in
+  let%map.Deferred.Or_error connection =
+    Connection.open_ ~time_source ~timeout:handshake_timeout ~headers url
+  in
   let messages_reader, messages_writer = Pipe.create () in
   let t =
     { url
@@ -352,6 +383,7 @@ let connect
     ; initial_backoff
     ; max_backoff
     ; backoff_jitter
+    ; handshake_timeout
     ; on_connect
     ; log_name
     ; time_source
