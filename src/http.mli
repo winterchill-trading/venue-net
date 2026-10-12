@@ -50,3 +50,38 @@ val decode_json : response -> f:(Yojson.Safe.t -> 'a) -> 'a Or_error.t
 
 (** [is_success status] is true for 2xx. *)
 val is_success : int -> bool
+
+(** Record mode: every completed request (any status) is written as one JSON file, for
+    checking in as test fixtures. Transport failures are not recorded, and a failure to
+    write is logged, never returned.
+
+    Recording is off unless a directory is set, either with [set_dir] or through the
+    [VENUE_NET_HTTP_RECORD] environment variable read at startup. Files are named
+    [<METHOD>-<host and path>-<n>.json] with the first free [n]. Values of headers and
+    query parameters whose names contain [key], [sign], [auth], [token], [passphrase] or
+    [cookie] are replaced by ["<redacted>"]; request bodies are written verbatim. *)
+module Record : sig
+  type entry =
+    { meth : string
+    ; uri : string
+    ; request_headers : (string * string) list
+    ; request_body : string option
+    ; status : int
+    ; response_body : string
+    }
+  [@@deriving sexp_of]
+
+  (** ["VENUE_NET_HTTP_RECORD"] *)
+  val env_var : string
+
+  val set_dir : string option -> unit
+  val dir : unit -> string option
+
+  (** Reads one recorded file back. *)
+  val load : string -> entry Or_error.t Deferred.t
+
+  (** The JSON written to each file. *)
+  val entry_to_json : entry -> Yojson.Safe.t
+
+  val entry_of_json : Yojson.Safe.t -> entry
+end
