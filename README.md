@@ -19,6 +19,10 @@ dune build && dune test
 has no TLS. On macOS with Homebrew's `openssl@4`, see the OpenSSL notes in
 [hl-client](https://github.com/winterchill-trading/hl-client#macos-and-openssl).
 
+CI installs the opam dependencies through the shared
+[ox-setup](https://github.com/winterchill-trading/infra/blob/main/docs/ci.md) action, which
+caches the built opam switch between runs.
+
 ## `Venue_net.Http`
 
 ```ocaml
