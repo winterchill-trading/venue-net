@@ -1,0 +1,16 @@
+(library
+ (name venue_net_test)
+ (libraries
+  core
+  async
+  async_websocket
+  cohttp
+  cohttp-async
+  venue-net
+  yojson
+  uri)
+ (inline_tests
+  (flags
+   (:standard -source-tree-root .)))
+ (preprocess
+  (pps ppx_jane)))
