@@ -44,6 +44,19 @@ val is_success  : int -> bool
   `Error` carrying the status and body.
 - `https://` goes through OpenSSL with SNI (cohttp-async sets it).
 
+### Record mode
+
+```sh
+VENUE_NET_HTTP_RECORD=fixtures/ my-client-binary ...
+```
+
+or `Http.Record.set_dir (Some "fixtures")` in code. Every completed request (any status)
+becomes one JSON file, `<METHOD>-<host and path>-<n>.json`, holding the method, URI,
+request headers and body, status and response body; `Http.Record.load` reads one back
+for decode tests. Header and query values whose names contain `key`, `sign`, `auth`,
+`token`, `passphrase` or `cookie` are written as `<redacted>`; request bodies are
+written verbatim, so check them before committing fixtures from signed endpoints.
+
 ## `Venue_net.Ws_client`
 
 ```ocaml
@@ -123,7 +136,8 @@ this library was checked for work left behind:
 ## Tests
 
 `dune test` runs without network access: an HTTP echo server on `127.0.0.1` (methods,
-content types, form encoding, transport errors, `decode_json`), the handshake (RFC 6455
+content types, form encoding, transport errors, `decode_json`, record mode and
+redaction), the handshake (RFC 6455
 vectors), base64, backoff and a jitter band property, and a loopback websocket server that checks extra handshake
 headers, `on_connect`, server close and reconnect, text keepalive, silent-connection
 replacement, ping-frame pongs as traffic, a refused upgrade and shutdown.
