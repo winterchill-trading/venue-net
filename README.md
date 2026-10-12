@@ -102,6 +102,24 @@ val is_closed    : t -> bool
   closed by `close`. `send` drops the frame while disconnected.
 - Logs go to `Log.Global`, prefixed with `log_name`.
 
+## Timeouts and abandoned work
+
+`with_timeout` only stops waiting; the work it raced keeps running. Every timeout in
+this library was checked for work left behind:
+
+- `Ws_client` handshake (`handshake_timeout`): on timeout the attempt's socket is closed
+  as soon as it exists, which fails the pending handshake read, and a connection that
+  completes anyway is closed. The stalled-handshake test checks the descriptor count.
+- `Ws_client` reconnect sleep: raced against `close`; after `close` the alarm stays
+  scheduled until it fires (at most `max_backoff`) and then does nothing.
+- `Ws_client` keepalive: `every'` stops when the connection's frame pipe closes.
+- `Http` has no timeout. cohttp-async's `?interrupt` only covers the TCP connect, and
+  closing a `Cohttp_async.Client.Connection` waits for the running request, so a stalled
+  response cannot be cancelled. A caller that wraps an `Http` call in `with_timeout`
+  abandons a socket that stays open until the server answers or the kernel gives up.
+- Tests: racing `Pipe.read` against a timeout leaves the read queued on the pipe, where
+  it swallows the next message. Wait on `Pipe.values_available` and then `Pipe.read_now`.
+
 ## Tests
 
 `dune test` runs without network access: an HTTP echo server on `127.0.0.1` (methods,
