@@ -136,12 +136,22 @@ module Record = struct
   ;;
 end
 
+(* cohttp-async's default TLS config never checks the certificate's host name; see
+   [Tls]. Plain [http://] needs no config. *)
+let ssl_config uri =
+  match Uri.scheme uri, Uri.host uri with
+  | Some "https", Some host -> Some (Tls.config ~host)
+  | _ -> None
+;;
+
 let request ?content_type ?(headers = []) ?body meth uri =
   let headers = header_list ?content_type headers in
   let request_body = body in
   let body = Option.map body ~f:Cohttp_async.Body.of_string in
   Monitor.try_with_or_error ~extract_exn:true (fun () ->
-    let%bind response, body = Cohttp_async.Client.call ~headers ?body meth uri in
+    let%bind response, body =
+      Cohttp_async.Client.call ~headers ?body ?ssl_config:(ssl_config uri) meth uri
+    in
     let%bind body = Cohttp_async.Body.to_string body in
     let response = Cohttp.Code.code_of_status (Cohttp.Response.status response), body in
     let%map () = Record.save ~headers ~body:request_body meth uri response in
