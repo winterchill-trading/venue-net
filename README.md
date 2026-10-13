@@ -77,6 +77,7 @@ val connect
   -> ?backoff_jitter:float                (* default 0.2 *)
   -> ?handshake_timeout:Time_ns.Span.t    (* default 10s *)
   -> ?on_connect:(t -> unit Deferred.t)
+  -> ?on_message:(string -> unit)         (* frames straight from the connection *)
   -> ?log_name:string
   -> ?time_source:Time_source.t           (* default wall clock *)
   -> url:Uri.t
@@ -117,7 +118,49 @@ val is_closed    : t -> bool
   logged.
 - `messages` carries raw text frames from every connection, without pushback; it is
   closed by `close`. `send` drops the frame while disconnected.
+- `on_message`, when given, gets every text frame straight from the connection's frame
+  pipe, in order and across reconnects, and `messages` stays empty. It runs in the
+  reading job, so it must not block; an exception it raises goes to the monitor that
+  was current at `connect`, and the next frame is still delivered. `on_connect` still
+  runs before the first frame of each connection.
 - Logs go to `Log.Global`, prefixed with `log_name`.
+
+## Performance
+
+`dune exec bench/main.exe` (needs nothing but loopback) has two parts:
+
+- the delivery hop alone: 100,000 frames already queued on the connection's frame pipe,
+  moved to a counting consumer;
+- frames per second end to end against an in-process websocket server that writes
+  pre-encoded 200-byte text frames, either 1,000 per write (burst) or one per write.
+
+Frames are taken off the connection pipe a batch at a time (`Pipe.read_now'`).
+`Pipe.read_now`, which `Pipe.iter_without_pushback` calls once per element, allocates
+about 13 words per call (a lazy and two closures in `values_were_read`); the old relay
+paid that twice per frame, once for itself and once for the consumer of `messages`.
+`test/test_ws_deliver.ml` pins the hop at 13 words per frame through `messages` (the
+consumer's own `iter_without_pushback`) and 0 with `on_message`, and checks both paths
+against the old relay on random batch sequences.
+
+Measured on arm64 (Apple silicon, CI is amd64), release profile; dev and
+`OCAMLPARAM='_,O3=1'` are within a few ns of release:
+
+| | ns/frame | words/frame |
+| --- | --- | --- |
+| hop: old relay + `messages` iter | 53 to 64 | 26.0 |
+| hop: batched relay + `messages` iter | 22 to 25 | 13.0 |
+| hop: `on_message` | 2.5 | 0.0 |
+| burst end to end: old, `messages` iter | 133 to 141 | 60.6 |
+| burst: now, `messages` iter | 145 to 177 | 48.5 |
+| burst: now, `messages` with `Pipe.iter'` | 139 to 165 | 35.5 |
+| burst: now, `on_message` | 134 to 143 | 35.5 |
+| one frame per write: old, `messages` iter | 2850 to 3700 | 213.1 |
+| one frame per write: now, `on_message` | 2600 to 3700 | 189.2 |
+
+End-to-end times were taken on a loaded machine and the spread between runs is larger
+than the change; the word counts are exact. Most of the remaining 35 words per frame are
+async_websocket's (`Iobuf.to_string` of the payload, the frame record), outside this
+library.
 
 ## Timeouts and abandoned work
 
@@ -145,6 +188,8 @@ redaction), the handshake (RFC 6455
 vectors), base64, backoff and a jitter band property, and a loopback websocket server that checks extra handshake
 headers, `on_connect`, server close and reconnect, text keepalive, silent-connection
 replacement, ping-frame pongs as traffic, a refused upgrade and shutdown.
+`test_ws_deliver.ml` pins words per frame of the delivery hop and checks it against the
+old per-frame relay; the loopback tests also cover `on_message` across a reconnect.
 `test_ws_fake_clock.ml` runs the reconnect backoff (1 s, 2 s, 4 s) on a synthetic clock
 and checks that a listener which never answers the upgrade times out and leaves the open
 file descriptor count where it started.
