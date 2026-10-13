@@ -54,6 +54,12 @@ type t
       as frames start being read; use it to authenticate and (re)subscribe. [reconnects t]
       tells a first connection ([0]) from a reconnection. Exceptions it raises are logged;
       the connection is kept.
+    - [on_message], when given, receives every incoming text frame straight from the
+      connection's frame pipe, in order, with no second pipe in between; [messages] then
+      stays empty. It runs synchronously in the reading job, so it should not block. An
+      exception it raises is sent to the monitor that was current when [connect] was
+      called, and delivery goes on with the next frame. Without it, frames are relayed to
+      [messages].
     - [log_name] (default ["venue-net ws"]) prefixes log lines.
     - [time_source] (default the wall clock) drives the keepalive, the silence watchdog,
       the handshake timeout and the reconnection delay, so tests can step them with a
@@ -67,6 +73,7 @@ val connect
   -> ?backoff_jitter:float
   -> ?handshake_timeout:Time_ns.Span.t
   -> ?on_connect:(t -> unit Deferred.t)
+  -> ?on_message:(string -> unit)
   -> ?log_name:string
   -> ?time_source:Time_source.t
   -> url:Uri.t
@@ -76,7 +83,7 @@ val connect
 val url : t -> Uri.t
 
 (** Raw text frames from all connections. Closed by [close]. Buffered without pushback, so
-    consumers should keep up. *)
+    consumers should keep up. Empty when [connect] was given [on_message]. *)
 val messages : t -> string Pipe.Reader.t
 
 (** Send a text frame on the current connection; dropped if disconnected. *)
@@ -121,4 +128,14 @@ module For_testing : sig
     -> random_state:Random.State.t
     -> Time_ns.Span.t
     -> Time_ns.Span.t
+
+  (** [deliver from_server ~received ~on_message ~messages] moves one connection's frames
+      to [on_message], or to [messages] when it is [None], until [from_server] closes,
+      setting [received] on each frame. *)
+  val deliver
+    :  string Pipe.Reader.t
+    -> received:bool ref
+    -> on_message:(string -> unit) option
+    -> messages:string Pipe.Writer.t
+    -> unit Deferred.t
 end

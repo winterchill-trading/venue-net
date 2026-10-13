@@ -229,6 +229,7 @@ type t =
   ; backoff_jitter : float
   ; handshake_timeout : Time_ns.Span.t
   ; on_connect : t -> unit Deferred.t
+  ; on_message : (string -> unit) option
   ; log_name : string
   ; time_source : Time_source.t
   ; mutable connection : Connection.t option
@@ -289,6 +290,42 @@ let watch t (connection : Connection.t) ~received =
          else Connection.send_ping connection t.ping)
 ;;
 
+(* Moves the frames of one connection to the consumer until its pipe closes: straight to
+   [on_message] when there is one, otherwise into the [messages] pipe. Frames are taken a
+   batch at a time with [read_now']: [Pipe.read_now] costs about 13 words per call (a lazy
+   and closures in [values_were_read]), [read_now'] the same per batch. Exceptions from
+   [on_message] go to the monitor that was current at [connect], and delivery goes on with
+   the next frame. Like [Pipe.iter_without_pushback], the first frame is handled in a
+   later job, so [on_connect] runs before it. *)
+let deliver from_server ~received ~on_message ~messages =
+  let monitor = Monitor.current () in
+  let handle_batch =
+    match on_message with
+    | Some on_message ->
+      let f frame =
+        try on_message frame with
+        | exn -> Monitor.send_exn monitor exn
+      in
+      fun batch -> Queue.iter batch ~f
+    | None ->
+      fun batch ->
+        if not (Pipe.is_closed messages)
+        then Pipe.transfer_in_without_pushback messages ~from:batch
+  in
+  Deferred.create (fun finished ->
+    let rec wait () = upon (Pipe.values_available from_server) read
+    and read (_ : [ `Ok | `Eof ]) =
+      match Pipe.read_now' from_server with
+      | `Eof -> Ivar.fill_exn finished ()
+      | `Nothing_available -> wait ()
+      | `Ok batch ->
+        received := true;
+        handle_batch batch;
+        read `Ok
+    in
+    wait ())
+;;
+
 (* Runs one connection until it closes. *)
 let serve t (connection : Connection.t) =
   t.connection <- Some connection;
@@ -304,9 +341,11 @@ let serve t (connection : Connection.t) =
   watch t connection ~received;
   run_on_connect t;
   let%bind () =
-    Pipe.iter_without_pushback connection.from_server ~f:(fun frame ->
-      received := true;
-      Pipe.write_without_pushback_if_open t.messages_writer frame)
+    deliver
+      connection.from_server
+      ~received
+      ~on_message:t.on_message
+      ~messages:t.messages_writer
   in
   t.connection <- None;
   let%map reason = Websocket.close_finished connection.ws in
@@ -366,6 +405,7 @@ let connect
   ?(backoff_jitter = 0.2)
   ?(handshake_timeout = Time_ns.Span.of_sec 10.)
   ?(on_connect = fun _ -> return ())
+  ?on_message
   ?(log_name = "venue-net ws")
   ?(time_source = Time_source.wall_clock ())
   ~url
@@ -385,6 +425,7 @@ let connect
     ; backoff_jitter
     ; handshake_timeout
     ; on_connect
+    ; on_message
     ; log_name
     ; time_source
     ; connection = None
@@ -417,4 +458,5 @@ module For_testing = struct
   let check_handshake_response = check_handshake_response
   let backoff = backoff
   let jittered = jittered
+  let deliver = deliver
 end
