@@ -6,6 +6,7 @@
   async_websocket
   cohttp
   cohttp-async
+  conduit-async
   venue-net
   yojson
   uri)
