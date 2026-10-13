@@ -146,8 +146,9 @@ let tcp_connect uri =
   let addr : _ Conduit_async.V3.addr =
     match addr with
     | (OpenSSL (inet, _) | Inet inet) when is_tls uri ->
-      (* [resolve_uri] builds a TLS config without SNI, which CDNs reject. *)
-      OpenSSL (inet, Conduit_async.V3.Ssl.Config.create ~hostname:host ())
+      (* [resolve_uri] builds a TLS config without SNI, which CDNs reject, and without
+         a host-name check; [Tls.config_v3] sets both. *)
+      OpenSSL (inet, Tls.config_v3 ~host)
     | addr -> addr
   in
   let%map _socket, reader, writer = Conduit_async.V3.connect addr in
