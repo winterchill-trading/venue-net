@@ -32,8 +32,8 @@ let payload =
   prefix ^ String.make (payload_bytes - String.length prefix - 3) '1' ^ {|"}]|}
 ;;
 
-let block_frames = 1_000
-let block = String.concat (List.init block_frames ~f:(fun _ -> encode_frame payload))
+let block frames = String.concat (List.init frames ~f:(fun _ -> encode_frame payload))
+let blocks = Int.Table.create ()
 
 let rec read_headers reader acc =
   match%bind Reader.read_line reader with
@@ -46,14 +46,16 @@ let rec read_headers reader acc =
        | None -> acc)
 ;;
 
-let blast writer n =
+(* [n] frames, [per_write] of them per write, waiting for each write to flush. *)
+let blast writer ~n ~per_write =
+  let block = Hashtbl.find_or_add blocks per_write ~default:(fun () -> block per_write) in
   Deferred.repeat_until_finished n (fun left ->
     if left <= 0
     then return (`Finished ())
     else (
       Writer.write writer block;
       let%map () = Writer.flushed writer in
-      `Repeat (left - block_frames)))
+      `Repeat (left - per_write)))
 ;;
 
 let handle reader writer =
@@ -71,9 +73,10 @@ let handle reader writer =
   let ws = Websocket.create ~opcode:`Text ~role:Server reader writer in
   let from_client, to_client = Websocket.pipes ws in
   Pipe.iter from_client ~f:(fun frame ->
-    match String.chop_prefix frame ~prefix:"blast:" with
-    | Some n -> blast writer (Int.of_string n)
-    | None -> Pipe.write to_client frame)
+    match String.split frame ~on:':' with
+    | [ "blast"; n; per_write ] ->
+      blast writer ~n:(Int.of_string n) ~per_write:(Int.of_string per_write)
+    | _ -> Pipe.write to_client frame)
 ;;
 
 let start_server () =
@@ -89,13 +92,13 @@ type result =
   }
 
 (* Sends "blast:n" and waits until [received] has counted [n] frames. *)
-let measure client ~n ~(received : int ref) ~(done_ : unit Ivar.t ref) =
+let measure client ~n ~per_write ~(received : int ref) ~(done_ : unit Ivar.t ref) =
   received := 0;
   done_ := Ivar.create ();
   Gc.full_major ();
   let words0 = Gc.minor_words () in
   let t0 = Time_ns.now () in
-  let%bind () = Ws_client.send client (sprintf "blast:%d" n) in
+  let%bind () = Ws_client.send client (sprintf "blast:%d:%d" n per_write) in
   let%map () = Ivar.read !done_ in
   let t1 = Time_ns.now () in
   let words1 = Gc.minor_words () in
@@ -109,7 +112,7 @@ let counter ~n ~received ~done_ _frame =
   if !received = n then Ivar.fill_exn !done_ ()
 ;;
 
-let report name results =
+let report name ~n results =
   let best =
     List.min_elt results ~compare:(fun a b -> Float.compare a.seconds b.seconds)
   in
@@ -118,8 +121,8 @@ let report name results =
   printf
     "%-10s %10.0f frames/s  %8.1f ns/frame  %6.1f words/frame (min %.1f max %.1f)\n%!"
     name
-    (Float.of_int frames_per_run /. best.seconds)
-    (best.seconds *. 1e9 /. Float.of_int frames_per_run)
+    (Float.of_int n /. best.seconds)
+    (best.seconds *. 1e9 /. Float.of_int n)
     (List.sum (module Float) words ~f:Fn.id /. Float.of_int (List.length words))
     (Option.value_exn (List.min_elt words ~compare:Float.compare))
     (Option.value_exn (List.max_elt words ~compare:Float.compare))
@@ -129,32 +132,137 @@ let url server =
   Uri.of_string (sprintf "ws://127.0.0.1:%d/bench" (Tcp.Server.listening_on server))
 ;;
 
-let run_mode server name =
-  let n = frames_per_run in
+type mode =
+  | Pipe_iter (** [messages] read with [Pipe.iter_without_pushback] *)
+  | Pipe_iter' (** [messages] read a batch at a time with [Pipe.iter'] *)
+  | On_message (** frames handed to [on_message] *)
+
+let mode_name = function
+  | Pipe_iter -> "pipe iter"
+  | Pipe_iter' -> "pipe iter'"
+  | On_message -> "on_message"
+;;
+
+let run_mode server mode ~n ~per_write =
   let received = ref 0 in
   let done_ = ref (Ivar.create ()) in
   let on_frame = counter ~n ~received ~done_ in
-  let%bind client = Ws_client.connect ~url:(url server) () >>| Or_error.ok_exn in
-  don't_wait_for (Pipe.iter_without_pushback (Ws_client.messages client) ~f:on_frame);
+  let%bind client =
+    match mode with
+    | On_message -> Ws_client.connect ~on_message:on_frame ~url:(url server) ()
+    | Pipe_iter | Pipe_iter' -> Ws_client.connect ~url:(url server) ()
+  in
+  let client = Or_error.ok_exn client in
+  (match mode with
+   | On_message -> ()
+   | Pipe_iter ->
+     don't_wait_for (Pipe.iter_without_pushback (Ws_client.messages client) ~f:on_frame)
+   | Pipe_iter' ->
+     don't_wait_for
+       (Pipe.iter' (Ws_client.messages client) ~f:(fun batch ->
+          Queue.iter batch ~f:on_frame;
+          return ())));
   (* One warm-up run, then [runs] measured ones. *)
-  let%bind (_ : result) = measure client ~n ~received ~done_ in
+  let%bind (_ : result) = measure client ~n ~per_write ~received ~done_ in
   let%bind results =
     Deferred.List.init runs ~how:`Sequential ~f:(fun _ ->
-      measure client ~n ~received ~done_)
+      measure client ~n ~per_write ~received ~done_)
   in
-  report name results;
+  report (mode_name mode) ~n results;
   Ws_client.close client
+;;
+
+(* The delivery hop alone, in process: [hop_frames] frames already queued on a closed pipe
+   (one batch) are moved to a counting consumer. [relay] is the per-frame relay that
+   [Ws_client] used before batching. *)
+let hop_frames = 100_000
+
+let relay from_server ~messages =
+  Pipe.iter_without_pushback from_server ~f:(fun frame ->
+    Pipe.write_without_pushback_if_open messages frame)
+;;
+
+let hop name ~run =
+  let measure () =
+    let from_server, writer = Pipe.create () in
+    for _ = 1 to hop_frames do
+      Pipe.write_without_pushback writer payload
+    done;
+    Pipe.close writer;
+    let count = ref 0 in
+    let words0 = Gc.minor_words () in
+    let t0 = Time_ns.now () in
+    let%map () = run from_server ~count in
+    let t1 = Time_ns.now () in
+    assert (!count = hop_frames);
+    ( Time_ns.Span.to_sec (Time_ns.diff t1 t0)
+    , Float.of_int (Gc.minor_words () - words0) /. Float.of_int hop_frames )
+  in
+  let%map results = Deferred.List.init 20 ~how:`Sequential ~f:(fun _ -> measure ()) in
+  let best =
+    List.fold results ~init:Float.infinity ~f:(fun acc (s, _) -> Float.min acc s)
+  in
+  printf
+    "%-24s %8.1f ns/frame  %5.1f words/frame\n%!"
+    name
+    (best *. 1e9 /. Float.of_int hop_frames)
+    (snd (List.last_exn results))
+;;
+
+let via_messages ~deliver from_server ~count =
+  let messages_reader, messages_writer = Pipe.create () in
+  let consumer =
+    Pipe.iter_without_pushback messages_reader ~f:(fun (_ : string) -> incr count)
+  in
+  let%bind () = deliver from_server ~messages:messages_writer in
+  Pipe.close messages_writer;
+  consumer
+;;
+
+let hops () =
+  printf "delivery hop only: %d queued frames, best of 20\n%!" hop_frames;
+  let%bind () = hop "relay + pipe iter (old)" ~run:(via_messages ~deliver:relay) in
+  let%bind () =
+    hop
+      "deliver + pipe iter"
+      ~run:
+        (via_messages ~deliver:(fun from_server ~messages ->
+           Ws_client.For_testing.deliver
+             from_server
+             ~received:(ref false)
+             ~on_message:None
+             ~messages))
+  in
+  hop "deliver + on_message" ~run:(fun from_server ~count ->
+    let _, messages = Pipe.create () in
+    Ws_client.For_testing.deliver
+      from_server
+      ~received:(ref false)
+      ~on_message:(Some (fun (_ : string) -> incr count))
+      ~messages)
 ;;
 
 let main () =
   Log.Global.set_output [];
+  let%bind () = hops () in
   let%bind server = start_server () in
-  printf
-    "%d frames of %d bytes per run, best of %d runs\n%!"
-    frames_per_run
-    payload_bytes
-    runs;
-  let%bind () = run_mode server "pipe" in
+  let%bind () =
+    Deferred.List.iter
+      ~how:`Sequential
+      [ "burst", frames_per_run, 1_000; "one per write", frames_per_run / 10, 1 ]
+      ~f:(fun (scenario, n, per_write) ->
+        printf
+          "%s: %d frames of %d bytes per run, %d per server write, best of %d runs\n%!"
+          scenario
+          n
+          payload_bytes
+          per_write
+          runs;
+        Deferred.List.iter
+          ~how:`Sequential
+          [ Pipe_iter; Pipe_iter'; On_message ]
+          ~f:(fun mode -> run_mode server mode ~n ~per_write))
+  in
   Tcp.Server.close ~close_existing_connections:true server
 ;;
 
