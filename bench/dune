@@ -1,0 +1,5 @@
+(executable
+ (name main)
+ (libraries core core_unix.command_unix async async_websocket uri venue-net)
+ (preprocess
+  (pps ppx_jane)))
