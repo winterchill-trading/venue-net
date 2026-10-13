@@ -3,7 +3,9 @@
  (public_name venue-net)
  (libraries
   core
+  core_unix
   async
+  async_ssl
   yojson
   uri
   cohttp
