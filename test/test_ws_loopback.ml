@@ -274,3 +274,66 @@ let%expect_test "a refused upgrade fails connect" =
   [%expect {| ("websocket upgrade refused" (status_line "HTTP/1.1 404 Not Found")) |}];
   Server.close server
 ;;
+
+let%expect_test "on_message gets every frame across a reconnect; messages stays empty" =
+  Log.Global.set_output [];
+  let%bind server = Server.start () in
+  let got = Queue.create () in
+  let wanted = ref 0 in
+  let reached = ref (Ivar.create ()) in
+  let wait_for n =
+    wanted := n;
+    reached := Ivar.create ();
+    if Queue.length got >= n then Ivar.fill_if_empty !reached ();
+    Clock_ns.with_timeout (Time_ns.Span.of_sec 5.) (Ivar.read !reached)
+    >>| function
+    | `Result () -> ()
+    | `Timeout -> print_endline "timeout"
+  in
+  let raised = Queue.create () in
+  let%bind ws =
+    (* [on_message] raises on "boom"; the exception reaches the monitor current at
+       [connect] and delivery goes on. *)
+    Monitor.try_with
+      ~rest:(`Call (fun exn -> Queue.enqueue raised (Exn.to_string exn)))
+      (fun () ->
+        Ws_client.connect
+          ~initial_backoff:(ms 10)
+          ~on_connect:(fun ws -> Ws_client.send ws "sub:trades")
+          ~on_message:(fun frame ->
+            Queue.enqueue got frame;
+            if Queue.length got >= !wanted then Ivar.fill_if_empty !reached ();
+            if String.equal frame "ack:boom@1" then failwith "boom")
+          ~url:(Server.url server)
+          ())
+    >>| Result.ok_exn
+    >>| ok_exn
+  in
+  let%bind () = wait_for 2 in
+  let%bind () = Ws_client.send ws "sub:boom" in
+  let%bind () = wait_for 3 in
+  let%bind () =
+    Websocket.close
+      (Queue.get server.sockets 0)
+      ~code:Endpoint_going_away
+      ~reason:"restart"
+  in
+  let%bind () = wait_for 4 in
+  let%bind () = Ws_client.send ws "ping" in
+  let%bind () = wait_for 5 in
+  let%bind () = Ws_client.close ws in
+  let%bind () = Pipe.closed (Ws_client.messages ws) in
+  print_s
+    [%sexp
+      { frames = (Queue.to_list got : string list)
+      ; raised = (Queue.length raised : int)
+      ; messages = (Pipe.length (Ws_client.messages ws) : int)
+      ; reconnects = (Ws_client.reconnects ws : int)
+      }];
+  [%expect
+    {|
+    ((frames ("hello 1" ack:trades@1 ack:boom@1 ack:trades@2 pong)) (raised 1)
+     (messages 0) (reconnects 1))
+    |}];
+  Server.close server
+;;
