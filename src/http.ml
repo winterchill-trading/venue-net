@@ -136,8 +136,8 @@ module Record = struct
   ;;
 end
 
-(* cohttp-async's default TLS config never checks the certificate's host name; see
-   [Tls]. Plain [http://] needs no config. *)
+(* cohttp-async's default TLS config never checks the certificate's host name; see [Tls].
+   Plain [http://] needs no config. *)
 let ssl_config uri =
   match Uri.scheme uri, Uri.host uri with
   | Some "https", Some host -> Some (Tls.config ~host)
