@@ -23,6 +23,17 @@ CI installs the opam dependencies through the shared
 [ox-setup](https://github.com/winterchill-trading/infra/blob/main/docs/ci.md) action, which
 caches the built opam switch between runs.
 
+## TLS
+
+Every `https://` request and `wss://` connection uses `Venue_net.Tls`: `Verify_peer`, an
+explicit CA bundle (`SSL_CERT_FILE` if set, else the usual system and Homebrew paths, else
+OpenSSL's defaults) and a check that the certificate's names match the URL's host.
+conduit-async 8.0.0's default client config checks the chain but not the host name, so
+before this a valid certificate for any other domain was accepted.
+`test/test_tls.ml` checks that the `self-signed`, `expired`, `untrusted-root` and
+`wrong.host` badssl.com hosts are rejected and a good one accepted on both paths; it is
+skipped when badssl.com does not resolve.
+
 ## `Venue_net.Http`
 
 ```ocaml
@@ -46,7 +57,7 @@ val is_success  : int -> bool
   `application/x-www-form-urlencoded`, unless `headers` already has a content type.
 - `decode_json` turns a non-2xx status, invalid JSON and exceptions from `f` into an
   `Error` carrying the status and body.
-- `https://` goes through OpenSSL with SNI (cohttp-async sets it).
+- `https://` goes through OpenSSL with SNI and full certificate checks (see [TLS](#tls)).
 
 ### Record mode
 
