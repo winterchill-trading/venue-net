@@ -1,0 +1,7 @@
+; Built by `dune build` (and so in CI); not run, as both need network access.
+
+(executables
+ (names http_get ws_tail)
+ (libraries core core_unix.command_unix async venue-net uri yojson)
+ (preprocess
+  (pps ppx_jane)))
