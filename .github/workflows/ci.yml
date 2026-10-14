@@ -11,5 +11,13 @@ jobs:
       - uses: winterchill-trading/infra/.github/actions/ox-setup@main
       - run: opam exec -- dune build
       - run: opam exec -- dune test
+      - run: opam install -y odoc
+      - name: Build API docs (odoc warnings fail the step)
+        env:
+          ODOC_WARN_ERROR: "true"
+        run: |
+          set -o pipefail
+          opam exec -- dune build @doc --display short 2>&1 | tee doc.log
+          if grep -q "Warning" doc.log; then exit 1; fi
   obj-magic:
     uses: winterchill-trading/infra/.github/workflows/obj-magic.yml@main
