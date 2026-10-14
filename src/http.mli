@@ -1,9 +1,12 @@
-(** Small HTTP client helpers on top of cohttp-async.
+(** Small HTTP/1.1 client helpers for Async.
 
-    Every call reads the whole response body and returns [(status, body)]. Connection and
-    transport failures become [Error] (tagged with the method and URI); any HTTP status,
-    including 4xx and 5xx, is returned as [Ok], so callers can decode venue error bodies.
-    [https://] URIs use OpenSSL via conduit-async, which sets SNI to the URI's host. *)
+    Every call opens a new connection, sends one request, reads the whole response body,
+    closes the connection and returns [(status, body)]. Connection and transport failures
+    become [Error] (tagged with the method and URI); any HTTP status, including 4xx and
+    5xx, is returned as [Ok], so callers can decode an API's error bodies. Requests and
+    responses are encoded and parsed by cohttp; connections go through conduit-async.
+    [https://] URIs use OpenSSL with SNI, the CA bundle and the host-name check of {!Tls}.
+    There is no connection reuse, no redirect following and no response decompression. *)
 
 open! Core
 open Async
@@ -96,10 +99,15 @@ module Record : sig
     }
   [@@deriving sexp_of]
 
-  (** ["VENUE_NET_HTTP_RECORD"] *)
+  (** ["VENUE_NET_HTTP_RECORD"]: when set and non-empty at program start, its value is the
+      initial recording directory. *)
   val env_var : string
 
+  (** [set_dir (Some dir)] records every later request into [dir] (created on first
+      write); [set_dir None] stops recording. *)
   val set_dir : string option -> unit
+
+  (** The current recording directory, if recording is on. *)
   val dir : unit -> string option
 
   (** Reads one recorded file back. *)
@@ -108,5 +116,8 @@ module Record : sig
   (** The JSON written to each file. *)
   val entry_to_json : entry -> Yojson.Safe.t
 
+  (** Inverse of {!entry_to_json}.
+
+      @raise Yojson.Safe.Util.Type_error if a field is missing or has the wrong type. *)
   val entry_of_json : Yojson.Safe.t -> entry
 end
