@@ -12,7 +12,8 @@ jobs:
       - run: opam exec -- dune build
       - run: opam exec -- dune test
       # odoc does not declare result; the local switch only had it transitively.
-      - run: opam install -y result odoc
+      # listing the pins keeps the solver from dropping sibling packages
+      - run: opam install -y result odoc $(opam pin list --short)
       - name: Build API docs (odoc warnings fail the step)
         env:
           ODOC_WARN_ERROR: "true"
