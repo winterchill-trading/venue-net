@@ -98,6 +98,12 @@ val messages : t -> string Pipe.Reader.t
     result is determined when the frame has been handed to the connection's writer. *)
 val send : t -> string -> unit Deferred.t
 
+(** Like {!send}, but a frame that cannot be queued because there is no open connection is
+    an [Error] rather than dropped silently. [Ok] means the frame was queued on the
+    current connection, not that the server received it: a connection can still drop with
+    frames in flight. *)
+val send_or_error : t -> string -> unit Or_error.t Deferred.t
+
 (** True between a successful handshake and the end of that connection. *)
 val is_connected : t -> bool
 

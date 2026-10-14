@@ -255,6 +255,17 @@ let send t frame =
   | Some connection -> Connection.send connection frame
 ;;
 
+let send_or_error t frame =
+  match t.connection with
+  | Some connection when not (Pipe.is_closed connection.to_server) ->
+    let%map () = Connection.send connection frame in
+    Ok ()
+  | _ ->
+    return
+      (Or_error.error_s
+         [%message "websocket not connected" ~url:(Uri.to_string t.url : string)])
+;;
+
 let url_string t = Uri.to_string t.url
 
 let run_on_connect t =
