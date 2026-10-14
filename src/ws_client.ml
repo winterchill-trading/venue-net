@@ -231,6 +231,8 @@ type t =
   ; handshake_timeout : Time_ns.Span.t
   ; on_connect : t -> unit Deferred.t
   ; on_message : (string -> unit) option
+  ; max_buffered_messages : int option
+  ; mutable overflows : int
   ; log_name : string
   ; time_source : Time_source.t
   ; mutable connection : Connection.t option
@@ -244,6 +246,7 @@ let url t = t.url
 let messages t = t.messages_reader
 let is_connected t = Option.is_some t.connection
 let reconnects t = t.reconnects
+let overflows t = t.overflows
 let is_closed t = Ivar.is_full t.closed
 
 let send t frame =
@@ -298,7 +301,14 @@ let watch t (connection : Connection.t) ~received =
    [on_message] go to the monitor that was current at [connect], and delivery goes on with
    the next frame. Like [Pipe.iter_without_pushback], the first frame is handled in a
    later job, so [on_connect] runs before it. *)
-let deliver from_server ~received ~on_message ~messages =
+let deliver
+  ?max_buffered
+  ?(on_overflow = ignore)
+  from_server
+  ~received
+  ~on_message
+  ~messages
+  =
   let monitor = Monitor.current () in
   let handle_batch =
     match on_message with
@@ -309,9 +319,22 @@ let deliver from_server ~received ~on_message ~messages =
       in
       fun batch -> Queue.iter batch ~f
     | None ->
-      fun batch ->
-        if not (Pipe.is_closed messages)
-        then Pipe.transfer_in_without_pushback messages ~from:batch
+      (match max_buffered with
+       | None ->
+         fun batch ->
+           if not (Pipe.is_closed messages)
+           then Pipe.transfer_in_without_pushback messages ~from:batch
+       | Some max_buffered ->
+         (* Checked once per batch; [Pipe.length] does not allocate. *)
+         let overflowed = ref false in
+         fun batch ->
+           if not (Pipe.is_closed messages)
+           then (
+             Pipe.transfer_in_without_pushback messages ~from:batch;
+             if (not !overflowed) && Pipe.length messages > max_buffered
+             then (
+               overflowed := true;
+               on_overflow ())))
   in
   Deferred.create (fun finished ->
     let rec wait () = upon (Pipe.values_available from_server) read
@@ -341,8 +364,19 @@ let serve t (connection : Connection.t) =
     ());
   watch t connection ~received;
   run_on_connect t;
+  let on_overflow () =
+    t.overflows <- t.overflows + 1;
+    Log.Global.info_s
+      [%message
+        (sprintf "%s: messages not read fast enough, reconnecting" t.log_name)
+          ~url:(url_string t : string)
+          ~buffered:(Pipe.length t.messages_writer : int)];
+    don't_wait_for (Connection.close connection)
+  in
   let%bind () =
     deliver
+      ?max_buffered:t.max_buffered_messages
+      ~on_overflow
       connection.from_server
       ~received
       ~on_message:t.on_message
@@ -357,7 +391,17 @@ let serve t (connection : Connection.t) =
         (reason : Websocket.Connection_close_reason.t * string * Core.Info.t option)]
 ;;
 
+(* After an overflow, the next connection waits until the consumer has read [messages]
+   down to [max_buffered_messages] (the pipe's size budget), or [close]. *)
+let wait_for_consumer t =
+  match t.max_buffered_messages with
+  | Some max when Pipe.length t.messages_writer > max ->
+    Deferred.any [ Pipe.pushback t.messages_writer; Ivar.read t.closed ]
+  | _ -> return ()
+;;
+
 let rec reconnect_loop t ~delay =
+  let%bind () = wait_for_consumer t in
   if is_closed t
   then return ()
   else (
@@ -407,6 +451,7 @@ let connect
   ?(handshake_timeout = Time_ns.Span.of_sec 10.)
   ?(on_connect = fun _ -> return ())
   ?on_message
+  ?max_buffered_messages
   ?(log_name = "venue-net ws")
   ?(time_source = Time_source.wall_clock ())
   ~url
@@ -416,6 +461,8 @@ let connect
     Connection.open_ ~time_source ~timeout:handshake_timeout ~headers url
   in
   let messages_reader, messages_writer = Pipe.create () in
+  Option.iter max_buffered_messages ~f:(fun max ->
+    Pipe.set_size_budget messages_writer (Int.max 0 max));
   let t =
     { url
     ; headers
@@ -427,6 +474,8 @@ let connect
     ; handshake_timeout
     ; on_connect
     ; on_message
+    ; max_buffered_messages
+    ; overflows = 0
     ; log_name
     ; time_source
     ; connection = None

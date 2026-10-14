@@ -60,6 +60,12 @@ type t
       exception it raises is sent to the monitor that was current when [connect] was
       called, and delivery goes on with the next frame. Without it, frames are relayed to
       [messages].
+    - [max_buffered_messages] (default unbounded) bounds memory when the reader of
+      [messages] falls behind. When more than this many frames wait in [messages], the
+      current connection is closed (counted by {!overflows}), frames already in [messages]
+      are kept, and the next connection is opened only once the reader has brought
+      [messages] back down to this size. [on_connect] then runs as after any reconnection,
+      so the caller resubscribes and resyncs. It has no effect with [on_message].
     - [log_name] (default ["venue-net ws"]) prefixes log lines.
     - [time_source] (default the wall clock) drives the keepalive, the silence watchdog,
       the handshake timeout and the reconnection delay, so tests can step them with a
@@ -74,29 +80,38 @@ val connect
   -> ?handshake_timeout:Time_ns.Span.t
   -> ?on_connect:(t -> unit Deferred.t)
   -> ?on_message:(string -> unit)
+  -> ?max_buffered_messages:int
   -> ?log_name:string
   -> ?time_source:Time_source.t
   -> url:Uri.t
   -> unit
   -> t Or_error.t Deferred.t
 
+(** The URL given to {!connect}. *)
 val url : t -> Uri.t
 
 (** Raw text frames from all connections. Closed by [close]. Buffered without pushback, so
     consumers should keep up. Empty when [connect] was given [on_message]. *)
 val messages : t -> string Pipe.Reader.t
 
-(** Send a text frame on the current connection; dropped if disconnected. *)
+(** Send a text frame on the current connection; dropped silently if disconnected. The
+    result is determined when the frame has been handed to the connection's writer. *)
 val send : t -> string -> unit Deferred.t
 
+(** True between a successful handshake and the end of that connection. *)
 val is_connected : t -> bool
 
 (** Number of successful reconnections so far (the first connection does not count). *)
 val reconnects : t -> int
 
+(** Number of connections closed because [messages] held more than [max_buffered_messages]
+    frames. *)
+val overflows : t -> int
+
 (** Close the socket, stop reconnecting and close [messages]. Idempotent. *)
 val close : t -> unit Deferred.t
 
+(** True once {!close} has been called. *)
 val is_closed : t -> bool
 
 (** Pure pieces, exposed for testing. *)
@@ -131,9 +146,12 @@ module For_testing : sig
 
   (** [deliver from_server ~received ~on_message ~messages] moves one connection's frames
       to [on_message], or to [messages] when it is [None], until [from_server] closes,
-      setting [received] on each frame. *)
+      setting [received] on each frame. [on_overflow] is called once, the first time
+      [messages] holds more than [max_buffered] frames after a batch. *)
   val deliver
-    :  string Pipe.Reader.t
+    :  ?max_buffered:int
+    -> ?on_overflow:(unit -> unit)
+    -> string Pipe.Reader.t
     -> received:bool ref
     -> on_message:(string -> unit) option
     -> messages:string Pipe.Writer.t
