@@ -9,8 +9,9 @@
   yojson
   uri
   cohttp
-  cohttp-async
   conduit-async
+  ipaddr
+  ipaddr.unix
   async_websocket)
  (preprocess
   (pps ppx_jane)))

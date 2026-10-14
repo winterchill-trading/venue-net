@@ -28,6 +28,7 @@
   yojson
   cohttp
   cohttp-async
+  ipaddr
   conduit-async
   async_websocket
   uri))

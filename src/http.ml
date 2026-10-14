@@ -144,46 +144,266 @@ let ssl_config uri =
   | _ -> None
 ;;
 
-let request ?content_type ?(headers = []) ?body meth uri =
+(* The connection is opened here rather than by [Cohttp_async.Client] so that a timed out
+   request can close its socket: cohttp-async keeps the reader and writer to itself, and
+   closing one of its [Connection.t]s waits for the running request. The request and
+   response are still written and parsed by cohttp ([Private.Make] is the functor its own
+   backends use), and the TLS config is the same [Tls.config] cohttp-async was given. *)
+module Input = struct
+  (* A growable read buffer over an Async [Reader.t], the input channel cohttp's parser
+     wants ([refill] plus a view of the buffered bytes). *)
+  type t =
+    { reader : Reader.t
+    ; mutable buf : Bytes.t
+    ; mutable pos : int
+    ; mutable len : int
+    }
+
+  (* Bound on the buffered, unparsed bytes; only a status line plus headers can reach it,
+     because bodies are read in pieces no longer than what is buffered. *)
+  let max_buffer = 1 lsl 20
+  let create reader = { reader; buf = Bytes.create 0x4000; pos = 0; len = 0 }
+
+  let refill t =
+    if t.pos > 0
+    then (
+      Bytes.blit ~src:t.buf ~src_pos:t.pos ~dst:t.buf ~dst_pos:0 ~len:t.len;
+      t.pos <- 0);
+    if t.len = Bytes.length t.buf
+    then (
+      if t.len >= max_buffer
+      then failwithf "HTTP response header longer than %d bytes" max_buffer ();
+      let buf = Bytes.create (2 * Bytes.length t.buf) in
+      Bytes.blit ~src:t.buf ~src_pos:0 ~dst:buf ~dst_pos:0 ~len:t.len;
+      t.buf <- buf);
+    match%map Reader.read t.reader t.buf ~pos:t.len ~len:(Bytes.length t.buf - t.len) with
+    | `Eof -> `Eof
+    | `Ok n ->
+      t.len <- t.len + n;
+      `Ok
+  ;;
+
+  let consume t n =
+    t.pos <- t.pos + n;
+    t.len <- t.len - n
+  ;;
+
+  let with_input_buffer t ~f =
+    let result, consumed =
+      f
+        (Bytes.unsafe_to_string ~no_mutation_while_string_reachable:t.buf)
+        ~pos:t.pos
+        ~len:t.len
+    in
+    consume t consumed;
+    result
+  ;;
+
+  let take t n =
+    let s = Bytes.To_string.sub t.buf ~pos:t.pos ~len:n in
+    consume t n;
+    s
+  ;;
+
+  (* A line ends at LF; a CR before it is dropped. At end of input, buffered bytes are
+     returned as a last line. *)
+  let rec read_line t =
+    let newline = ref (-1) in
+    let i = ref t.pos in
+    while !newline < 0 && !i < t.pos + t.len do
+      if Char.equal (Bytes.get t.buf !i) '\n' then newline := !i;
+      incr i
+    done;
+    if !newline >= 0
+    then (
+      let n = !newline - t.pos in
+      let line = take t (n + 1) in
+      let line = String.prefix line n in
+      return (Some (String.chop_suffix_if_exists line ~suffix:"\r")))
+    else (
+      match%bind refill t with
+      | `Ok -> read_line t
+      | `Eof -> return (if t.len = 0 then None else Some (take t t.len)))
+  ;;
+
+  let rec read t n =
+    if t.len > 0
+    then return (take t (Int.min n t.len))
+    else (
+      match%bind refill t with
+      | `Ok -> read t n
+      | `Eof -> return "")
+  ;;
+end
+
+module Io = struct
+  type 'a t = 'a Deferred.t
+
+  let ( >>= ) = Deferred.( >>= )
+  let return = Deferred.return
+
+  type ic = Input.t
+  type oc = Writer.t
+  type conn = unit
+
+  let refill = Input.refill
+  let with_input_buffer = Input.with_input_buffer
+  let read_line = Input.read_line
+  let read = Input.read
+
+  let write oc s =
+    Writer.write oc s;
+    return ()
+  ;;
+
+  let flush = Writer.flushed
+end
+
+module Request_io = Cohttp.Request.Private.Make (Io)
+module Response_io = Cohttp.Response.Private.Make (Io)
+
+let port uri =
+  match Uri.port uri, Uri.scheme uri with
+  | Some port, _ -> port
+  | None, Some "https" -> 443
+  | None, _ -> 80
+;;
+
+(* IPv4 first address, as cohttp-async resolves it. *)
+let address uri =
+  let host = Option.value (Uri.host uri) ~default:"localhost" in
+  match%map Unix.Addr_info.get ~host [ AI_FAMILY PF_INET; AI_SOCKTYPE SOCK_STREAM ] with
+  | { ai_addr = ADDR_INET (addr, _); _ } :: _ ->
+    let addr = Ipaddr_unix.of_inet_addr addr in
+    (match ssl_config uri with
+     | Some config -> `OpenSSL (addr, port uri, config)
+     | None -> `TCP (addr, port uri))
+  | _ -> raise_s [%message "Failed to resolve Uri" ~uri:(Uri.to_string uri : string)]
+;;
+
+let read_body (meth : Cohttp.Code.meth) response ic =
+  let has_body =
+    match meth with
+    | `HEAD -> `No
+    | _ -> Cohttp.Response.has_body response
+  in
+  match has_body with
+  | `No -> return ""
+  | `Yes | `Unknown ->
+    let reader = Response_io.make_body_reader response ic in
+    let buffer = Buffer.create 4096 in
+    let rec loop () =
+      match%bind Response_io.read_body_chunk reader with
+      | Chunk s ->
+        Buffer.add_string buffer s;
+        loop ()
+      | Final_chunk s ->
+        Buffer.add_string buffer s;
+        return (Buffer.contents buffer)
+      | Done -> return (Buffer.contents buffer)
+    in
+    loop ()
+;;
+
+let close_socket (reader, writer) =
+  let%bind () = Writer.close writer in
+  Reader.close reader
+;;
+
+(* One request on a fresh connection, closed afterwards. [socket] is filled once the
+   connection exists, so a caller that gives up can close it. *)
+let exchange ~interrupt ~socket ~headers ~body meth uri =
+  let%bind address = address uri in
+  let%bind reader, writer = Conduit_async.V2.connect ?interrupt address in
+  Ivar.fill_if_empty socket (reader, writer);
+  Monitor.protect
+    ~finally:(fun () -> close_socket (reader, writer))
+    (fun () ->
+      let body = Option.value body ~default:"" in
+      let request =
+        Cohttp.Request.make_for_client
+          ~headers
+          ~chunked:false
+          ~body_length:(Int64.of_int (String.length body))
+          meth
+          uri
+      in
+      let%bind () =
+        Request_io.write
+          ~flush:true
+          (fun w ->
+            if String.is_empty body then return () else Request_io.write_body w body)
+          request
+          writer
+      in
+      let ic = Input.create reader in
+      match%bind Response_io.read ic with
+      | `Eof -> failwith "Connection closed by remote host"
+      | `Invalid reason -> failwith reason
+      | `Ok response ->
+        let%map body = read_body meth response ic in
+        Cohttp.Code.code_of_status (Cohttp.Response.status response), body)
+;;
+
+let request ?content_type ?(headers = []) ?body ?timeout meth uri =
   let headers = header_list ?content_type headers in
   let request_body = body in
-  let body = Option.map body ~f:Cohttp_async.Body.of_string in
-  Monitor.try_with_or_error ~extract_exn:true (fun () ->
-    let%bind response, body =
-      Cohttp_async.Client.call ~headers ?body ?ssl_config:(ssl_config uri) meth uri
-    in
-    let%bind body = Cohttp_async.Body.to_string body in
-    let response = Cohttp.Code.code_of_status (Cohttp.Response.status response), body in
-    let%map () = Record.save ~headers ~body:request_body meth uri response in
-    response)
+  let socket = Ivar.create () in
+  (* The deadline also interrupts the TCP connect (and TLS handshake) in conduit. *)
+  let deadline = Option.map timeout ~f:(fun timeout -> timeout, Clock_ns.after timeout) in
+  let attempt =
+    Monitor.try_with_or_error ~rest:`Log ~extract_exn:true (fun () ->
+      exchange ~interrupt:(Option.map deadline ~f:snd) ~socket ~headers ~body meth uri)
+  in
+  let result =
+    match deadline with
+    | None -> attempt
+    | Some (timeout, deadline) ->
+      (match%map
+         Deferred.choose
+           [ Deferred.choice attempt (fun result -> `Result result)
+           ; Deferred.choice deadline (fun () -> `Timeout)
+           ]
+       with
+       | `Result result -> result
+       | `Timeout ->
+         (* Closing the socket fails the pending read, so nothing is left running. *)
+         upon (Ivar.read socket) (fun socket -> don't_wait_for (close_socket socket));
+         Or_error.error_s [%message "HTTP request timed out" (timeout : Time_ns.Span.t)])
+  in
+  (let%bind.Deferred.Or_error response = result in
+   let%map () = Record.save ~headers ~body:request_body meth uri response in
+   Ok response)
   |> Deferred.Or_error.tag_s
        ~tag:
          (Sexp.List [ Atom (Cohttp.Code.string_of_method meth); Atom (Uri.to_string uri) ])
 ;;
 
-let get ?headers uri = request ?headers `GET uri
-let delete ?headers uri = request ?headers `DELETE uri
-let put ?headers ?body uri = request ?headers ?body `PUT uri
+let get ?headers ?timeout uri = request ?headers ?timeout `GET uri
+let delete ?headers ?timeout uri = request ?headers ?timeout `DELETE uri
+let put ?headers ?body ?timeout uri = request ?headers ?body ?timeout `PUT uri
 
-let post_json ?headers uri json =
+let post_json ?headers ?timeout uri json =
   request
     ~content_type:"application/json"
     ?headers
+    ?timeout
     ~body:(Yojson.Safe.to_string json)
     `POST
     uri
 ;;
 
-let post_form ?headers uri params =
+let post_form ?headers ?timeout uri params =
   request
     ~content_type:"application/x-www-form-urlencoded"
     ?headers
+    ?timeout
     ~body:(Uri.encoded_of_query (List.map params ~f:(fun (k, v) -> k, [ v ])))
     `POST
     uri
 ;;
 
-let request ?headers ?body meth uri = request ?headers ?body meth uri
+let request ?headers ?body ?timeout meth uri = request ?headers ?body ?timeout meth uri
 let is_success status = status >= 200 && status < 300
 
 let decode_json ((status, body) : response) ~f =

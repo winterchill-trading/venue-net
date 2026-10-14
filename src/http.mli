@@ -11,20 +11,42 @@ open Async
 (** [(status, body)] *)
 type response = int * string [@@deriving sexp_of]
 
-(** [request meth uri] sends [body] (if any) with [headers] and reads the response. *)
+(** [request meth uri] sends [body] (if any) with [headers] on a new connection, reads the
+    whole response and closes the connection.
+
+    @param timeout
+      bounds the whole call: DNS lookup, connect, TLS handshake, sending and reading. When
+      it expires the result is an [Error] and the connection is closed, so no socket is
+      left waiting for a stalled server. The DNS lookup itself runs in a thread and is
+      only abandoned, not cancelled. Without [timeout] the call waits as long as the
+      server and the kernel let it. *)
 val request
   :  ?headers:(string * string) list
   -> ?body:string
+  -> ?timeout:Time_ns.Span.t
   -> Cohttp.Code.meth
   -> Uri.t
   -> response Or_error.t Deferred.t
 
-val get : ?headers:(string * string) list -> Uri.t -> response Or_error.t Deferred.t
-val delete : ?headers:(string * string) list -> Uri.t -> response Or_error.t Deferred.t
+(** [get uri] is [request `GET uri]. *)
+val get
+  :  ?headers:(string * string) list
+  -> ?timeout:Time_ns.Span.t
+  -> Uri.t
+  -> response Or_error.t Deferred.t
 
+(** [delete uri] is [request `DELETE uri]. *)
+val delete
+  :  ?headers:(string * string) list
+  -> ?timeout:Time_ns.Span.t
+  -> Uri.t
+  -> response Or_error.t Deferred.t
+
+(** [put ?body uri] is [request ?body `PUT uri]. *)
 val put
   :  ?headers:(string * string) list
   -> ?body:string
+  -> ?timeout:Time_ns.Span.t
   -> Uri.t
   -> response Or_error.t Deferred.t
 
@@ -32,13 +54,16 @@ val put
     content type. *)
 val post_json
   :  ?headers:(string * string) list
+  -> ?timeout:Time_ns.Span.t
   -> Uri.t
   -> Yojson.Safe.t
   -> response Or_error.t Deferred.t
 
-(** POSTs [params] as an [application/x-www-form-urlencoded] body. *)
+(** POSTs [params] as an [application/x-www-form-urlencoded] body, unless [headers]
+    already sets a content type. *)
 val post_form
   :  ?headers:(string * string) list
+  -> ?timeout:Time_ns.Span.t
   -> Uri.t
   -> (string * string) list
   -> response Or_error.t Deferred.t
