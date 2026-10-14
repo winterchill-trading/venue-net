@@ -95,3 +95,87 @@ let%expect_test "decode_json" =
     |}];
   return ()
 ;;
+
+let%expect_test "chunked and empty response bodies" =
+  let%bind server =
+    Cohttp_async.Server.create
+      ~on_handler_error:`Ignore
+      Tcp.Where_to_listen.of_port_chosen_by_os
+      (fun ~body:_ _ request ->
+         match Uri.path (Cohttp.Request.uri request) with
+         | "/chunked" ->
+           (* A pipe body has no known length, so cohttp sends it chunked. *)
+           Cohttp_async.Server.respond_with_pipe
+             (Pipe.of_list [ "one "; "two "; "three" ])
+         | _ -> Cohttp_async.Server.respond `No_content)
+  in
+  let uri path =
+    Uri.of_string
+      (sprintf "http://127.0.0.1:%d%s" (Cohttp_async.Server.listening_on server) path)
+  in
+  let%bind () = Http.get (uri "/chunked") >>| print in
+  let%bind () = Http.get (uri "/empty") >>| print in
+  let%bind () = Http.request `HEAD (uri "/chunked") >>| print in
+  [%expect {|
+    (Ok (200 "one two three"))
+    (Ok (204 ""))
+    (Ok (200 ""))
+    |}];
+  Cohttp_async.Server.close server
+;;
+
+let open_fds () =
+  let%map entries = Sys.readdir "/dev/fd" in
+  Array.length entries
+;;
+
+let%expect_test "timeout closes the socket of a stalled request" =
+  (* Accepts, reads the request and never answers. *)
+  let client_gone = Ivar.create () in
+  let%bind fds_before = open_fds () in
+  let%bind server =
+    Tcp.Server.create
+      ~on_handler_error:`Ignore
+      Tcp.Where_to_listen.of_port_chosen_by_os
+      (fun _ reader _ ->
+         let rec drain () =
+           match%bind Reader.read_line reader with
+           | `Eof -> return (Ivar.fill_if_empty client_gone ())
+           | `Ok _ -> drain ()
+         in
+         drain ())
+  in
+  let uri =
+    Uri.of_string (sprintf "http://127.0.0.1:%d/" (Tcp.Server.listening_on server))
+  in
+  let%bind result = Http.get ~timeout:(Time_ns.Span.of_ms 100.) uri in
+  (match result with
+   | Ok _ -> print_endline "unexpected response"
+   | Error error ->
+     (match Error.sexp_of_t error with
+      | List [ _tag; message ] -> print_s message
+      | sexp -> print_s sexp));
+  [%expect {| ("HTTP request timed out" (timeout 100ms)) |}];
+  (* The server sees end of input once the client's socket is closed. *)
+  let%bind () =
+    match%map Clock_ns.with_timeout (Time_ns.Span.of_sec 5.) (Ivar.read client_gone) with
+    | `Result () -> print_endline "server saw the client close"
+    | `Timeout -> print_endline "client socket left open"
+  in
+  let%bind () = Tcp.Server.close server in
+  let%bind () = Tcp.Server.close_finished_and_handlers_determined server in
+  let%bind fds_after = open_fds () in
+  print_s [%message (fds_after - fds_before : int)];
+  [%expect {|
+    server saw the client close
+    ("fds_after - fds_before" 0)
+    |}];
+  return ()
+;;
+
+let%expect_test "a timeout that does not expire changes nothing" =
+  with_echo_server (fun uri ->
+    let%bind () = Http.get ~timeout:(Time_ns.Span.of_sec 10.) (uri "/t") >>| print in
+    [%expect {| (Ok (200 "GET /t [-] ")) |}];
+    return ())
+;;
