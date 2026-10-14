@@ -24,10 +24,16 @@ module Server = struct
          | None -> acc)
   ;;
 
-  (* "ping" -> "pong" (when [pong]); "sub:x" -> "ack:x@<connection number>". *)
+  (* "ping" -> "pong" (when [pong]); "sub:x" -> "ack:x@<connection number>"; "burst:k" ->
+     k frames "b<i>@<connection number>". *)
   let reply ~pong to_client n frame =
     match String.chop_prefix frame ~prefix:"sub:" with
     | Some topic -> Pipe.write_without_pushback to_client (sprintf "ack:%s@%d" topic n)
+    | None when String.is_prefix frame ~prefix:"burst:" ->
+      let k = Int.of_string (String.chop_prefix_exn frame ~prefix:"burst:") in
+      for i = 1 to k do
+        Pipe.write_without_pushback to_client (sprintf "b%d@%d" i n)
+      done
     | None ->
       if pong && String.equal frame "ping"
       then Pipe.write_without_pushback to_client "pong"
@@ -334,6 +340,69 @@ let%expect_test "on_message gets every frame across a reconnect; messages stays 
     {|
     ((frames ("hello 1" ack:trades@1 ack:boom@1 ack:trades@2 pong)) (raised 1)
      (messages 0) (reconnects 1))
+    |}];
+  Server.close server
+;;
+
+let%expect_test "max_buffered_messages closes a connection the reader cannot keep up with"
+  =
+  Log.Global.set_output [];
+  let%bind server = Server.start () in
+  let%bind ws =
+    Ws_client.connect
+      ~initial_backoff:(ms 10)
+      ~max_buffered_messages:5
+      ~on_connect:(fun ws ->
+        if Ws_client.reconnects ws = 0
+        then Ws_client.send ws "burst:20"
+        else Ws_client.send ws "sub:again")
+      ~url:(Server.url server)
+      ()
+    >>| ok_exn
+  in
+  let rec until ?(tries = 500) f =
+    if f () || tries = 0
+    then return ()
+    else Clock_ns.after (ms 10) >>= fun () -> until ~tries:(tries - 1) f
+  in
+  (* Nobody reads [messages]: the burst overflows it and the connection is closed. *)
+  let%bind () =
+    until (fun () -> Ws_client.overflows ws > 0 && not (Ws_client.is_connected ws))
+  in
+  (* No new connection while the backlog is above the bound. *)
+  let%bind () = Clock_ns.after (ms 100) in
+  let connections_while_full = Queue.length server.sockets in
+  let backlog = Pipe.length (Ws_client.messages ws) in
+  let%bind send_while_down = Ws_client.send_or_error ws "lost" in
+  (* Reading the backlog lets the client reconnect and resubscribe. *)
+  let drained =
+    match Pipe.read_now' (Ws_client.messages ws) with
+    | `Ok frames -> Queue.length frames
+    | `Eof | `Nothing_available -> 0
+  in
+  let%bind () = read_and_print (Ws_client.messages ws) 1 in
+  let%bind send_while_up = Ws_client.send_or_error ws "ping" in
+  let%bind () = read_and_print (Ws_client.messages ws) 1 in
+  let%bind () = Ws_client.close ws in
+  let%bind send_after_close = Ws_client.send_or_error ws "lost" in
+  print_s
+    [%sexp
+      { overflows = (Ws_client.overflows ws : int)
+      ; connections_while_full : int
+      ; backlog_over_bound = (backlog > 5 : bool)
+      ; drained_all = (drained = backlog : bool)
+      ; reconnects = (Ws_client.reconnects ws : int)
+      ; send_while_down_failed = (Result.is_error send_while_down : bool)
+      ; send_while_up : unit Or_error.t
+      ; send_after_close_failed = (Result.is_error send_after_close : bool)
+      }];
+  [%expect
+    {|
+    ack:again@2
+    pong
+    ((overflows 1) (connections_while_full 1) (backlog_over_bound true)
+     (drained_all true) (reconnects 1) (send_while_down_failed true)
+     (send_while_up (Ok ())) (send_after_close_failed true))
     |}];
   Server.close server
 ;;
