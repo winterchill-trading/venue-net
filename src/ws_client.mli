@@ -1,4 +1,4 @@
-(** A reconnecting websocket client for text-frame APIs.
+(** A reconnecting websocket client for text-frame APIs (RFC 6455, client side).
 
     A [t] owns one logical connection. The upgrade handshake is written by hand (async
     websocket only does framing) over Conduit: [ws://] is plain TCP, [wss://] is OpenSSL
@@ -7,8 +7,9 @@
     the caller can re-authenticate and resubscribe. Incoming text frames from every
     connection are delivered, in order, on one pipe.
 
-    Subscriptions, de-duplication and message decoding are venue specific and stay with
-    the caller. *)
+    Subscriptions, de-duplication and message decoding are specific to each API and stay
+    with the caller. Binary frames, compression extensions and subprotocol negotiation are
+    not supported. *)
 
 open! Core
 open Async
@@ -16,10 +17,10 @@ open Async
 module Ping : sig
   (** Application-level keepalive.
 
-      - [`Text (payload, interval)]: send [payload] as a text frame every [interval] (e.g.
-        Hyperliquid's [{"method":"ping"}], Bybit's [{"op":"ping"}]).
+      - [`Text (payload, interval)]: send [payload] as a text frame every [interval], for
+        APIs that expect an application-level ping such as [{"op":"ping"}].
       - [`Frame interval]: send a websocket ping control frame every [interval].
-      - [`None]: send nothing, e.g. Binance, whose server pings the client. Incoming ping
+      - [`None]: send nothing, for servers that ping the client themselves. Incoming ping
         frames are always answered with pongs. *)
   type t =
     [ `Text of string * Time_ns.Span.t
@@ -28,8 +29,11 @@ module Ping : sig
     ]
   [@@deriving sexp_of]
 
+  (** The keepalive interval, [None] for [`None]. *)
   val interval : t -> Time_ns.Span.t option
 end
+
+(** One logical websocket connection, reconnected in the background until {!close}. *)
 
 type t
 
