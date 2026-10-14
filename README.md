@@ -309,6 +309,8 @@ dune-release opam submit    # pull request to opam-repository
 
 Nothing has been tagged or published.
 
+API docs are built with `dune build @doc` (odoc). CI fails on any odoc warning, so run it before tagging.
+
 ## Known gaps
 
 - `https://` and `wss://` need `async_ssl` built against OpenSSL 3 (see [Build](#build)).
