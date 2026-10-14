@@ -118,6 +118,6 @@ module Record : sig
 
   (** Inverse of {!entry_to_json}.
 
-      @raise Yojson.Safe.Util.Type_error if a field is missing or has the wrong type. *)
+      Raises [Yojson.Safe.Util.Type_error] if a field is missing or has the wrong type. *)
   val entry_of_json : Yojson.Safe.t -> entry
 end
